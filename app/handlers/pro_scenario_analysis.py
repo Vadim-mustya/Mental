@@ -1,28 +1,27 @@
 import asyncio
+import re
+import html
+
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.dispatcher.event.bases import SkipHandler
 
 from app.services.access import is_pro
 from app.services.ui_session import set_ui_message, get_ui_message
-from app.ui.keyboards import pro_locked_keyboard, pro_menu_keyboard, main_menu_keyboard
+from app.ui.keyboards import pro_locked_keyboard
 from app.services.ai_provider import AIProvider
 from app.storage.pro_scenario_store import (
     get_scenario, upsert_stage1, upsert_stage2, upsert_stage3
 )
-from aiogram.dispatcher.event.bases import SkipHandler
-
 
 router = Router()
-
 ai: AIProvider | None = None
 
-# пока тест-режим: GPT не вызываем
-DRY_RUN_NO_GPT = True
+DRY_RUN_NO_GPT = False
 
 MAX_CUSTOM_CHARS = 1000
 ASK_TO_SHORTEN_TO = 800
-
 PREFIX = "pro_scn"
 
 QUESTIONS = [
@@ -35,15 +34,12 @@ QUESTIONS = [
     "Моя самая большая мечта —",
 ]
 
-def _question_text(index: int) -> str:
-    return f"{index + 1}) {QUESTIONS[index]}"
-
-
 STATE: dict[int, dict] = {}
 
 
-def scenario_menu_keyboard(has_stage1: bool) -> InlineKeyboardMarkup:
-    # Нельзя сделать “неактивные” кнопки, поэтому показываем, но если нет stage1 — будем отвечать текстом
+# ---------- UI helpers ----------
+
+def scenario_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Пройти тест (Этап 1)", callback_data=f"{PREFIX}:start")],
         [InlineKeyboardButton(text="2️⃣ События, если не выйти из сценария", callback_data=f"{PREFIX}:stage2")],
@@ -62,6 +58,9 @@ def back_home_keyboard(is_first_question: bool) -> InlineKeyboardMarkup:
         ]
     ])
 
+
+def _question_text(index: int) -> str:
+    return f"{index + 1}) {QUESTIONS[index]}"
 
 
 async def _safe_answer(cb: CallbackQuery):
@@ -104,34 +103,129 @@ async def _force_new_ui(message: Message, tg_id: int, text: str, reply_markup=No
     set_ui_message(tg_id, sent.chat.id, sent.message_id)
 
 
-def _init_user(tg_id: int):
-    STATE[tg_id] = {"q": 0, "answers": {}}
+async def _send_scenario_menu(message: Message):
+    await message.answer("🧩 Меню «Сценарный анализ жизни»", reply_markup=scenario_menu_keyboard())
+
+
+# ---------- Telegram HTML helpers ----------
+
+_ALLOWED_TAGS = ["b", "i", "code", "blockquote"]
+
+
+def sanitize_telegram_html(text: str) -> str:
+    if not text:
+        return ""
+
+    placeholders: dict[str, str] = {}
+    out = text
+
+    def _put(tag_text: str) -> str:
+        key = f"__TAG_{len(placeholders)}__"
+        placeholders[key] = tag_text
+        return key
+
+    for tag in _ALLOWED_TAGS:
+        out = re.sub(fr"</{tag}>", lambda m: _put(m.group(0)), out)
+        out = re.sub(fr"<{tag}>", lambda m: _put(m.group(0)), out)
+
+    out = html.escape(out, quote=False)
+
+    for key, tag_text in placeholders.items():
+        out = out.replace(key, tag_text)
+
+    return out
+
+
+async def _send_long_html(message: Message, raw_html_text: str, limit: int = 3500):
+    safe = sanitize_telegram_html(raw_html_text).strip()
+    if not safe:
+        await message.answer("Пустой ответ.")
+        return
+
+    paragraphs = safe.split("\n\n")
+    chunk = ""
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+
+        candidate = (chunk + "\n\n" + p).strip() if chunk else p
+        if len(candidate) <= limit:
+            chunk = candidate
+            continue
+
+        if chunk:
+            await message.answer(chunk, parse_mode="HTML")
+            chunk = p
+        else:
+            t = p
+            while t:
+                await message.answer(t[:limit], parse_mode="HTML")
+                t = t[limit:]
+            chunk = ""
+
+    if chunk:
+        await message.answer(chunk, parse_mode="HTML")
+
+
+# ---------- prompts ----------
+
+ROLE_INTRO = (
+    "Представь, что ты опытный транзактный аналитик, психолог с 30-летним стажем и умеешь прогнозировать будущее человека, "
+    "учитывая его жизненный сценарий, условия экономики государства, в котором живет человек, и учитываешь возраст и силу "
+    "сопротивления к изменениям, относительно сценария, по которому живет человек."
+)
+
+
+def _formatting_and_structure_rules_stage1() -> str:
+    return (
+        "ФОРМАТ ОТВЕТА (строго соблюдай):\n"
+        "— Пиши в Telegram HTML: используй ТОЛЬКО теги <b>, <i>, <code>, <blockquote>.\n"
+        "— Никаких других HTML тегов. Никакого Markdown.\n"
+        "— Заголовки разделов делай жирными.\n"
+        "— Подзаголовки/вставки делай курсивом.\n"
+        "— Списки оформляй только маркерами «•».\n"
+        "— Между разделами оставляй 1 пустую строку.\n\n"
+        "Структура (строго):\n"
+        "<b>🧠 1. Твоя базовая жизненная позиция и сценарный фундамент</b>\n\n"
+        "<b>🎭 2. Твой сценарий по транзактному анализу</b>\n"
+        "<i>Вероятный базовый сценарий</i>\n"
+        "<i>Ключевые признаки</i> (список •)\n"
+        "<i>Эго-состояния</i>: Родитель / Взрослый / Ребёнок\n"
+        "<i>Внутренний конфликт</i>\n\n"
+        "<b>🎯 3. Интересы и их скрытый потенциал</b>\n\n"
+        "<b>🌍 4. Экономико-политический контекст (реалистично)</b>\n\n"
+        "<b>🧱 5. Твоё сопротивление изменениям</b>\n\n"
+        "<b>🔮 6. Прогноз по жизненным траекториям</b>\n"
+        "<i>📉 Если сценарий не менять</i>\n"
+        "<i>📈 Если сценарий скорректировать</i>\n\n"
+        "<b>⚡ 7. Ключевая точка роста (самое важное)</b>\n\n"
+        "<b>🧾 8. Итоговое описание тебя как личности</b>\n"
+        "Характеристики (только список •, 6–10 пунктов)\n"
+    )
 
 
 def _build_stage1_prompt(answers: dict[int, str]) -> str:
-    # Собираем финальный промт целиком как ты описал + добавляем маркеры для парсинга full/summary
-    # Важно: просим модель ответить строго в формате, чтобы можно было разделить и сохранить.
     parts = [
-        "Представь, что ты опытный транзактный аналитик, психолог с 30-летним стажем и умеешь прогнозировать будущее человека, "
-        "учитывая его жизненный сценарий, условия экономики и политики государств, в котором живет человек, "
-        "и учитываешь возраст и силу сопротивления к изменениям, относительно сценария, по которому живет человек.\n\n"
+        f"{ROLE_INTRO}\n\n"
         "Проанализируй следующие данные обо мне:\n"
     ]
 
     for i, q in enumerate(QUESTIONS):
-        a = answers.get(i, "").strip()
+        a = (answers.get(i) or "").strip()
         parts.append(f"{q} {a}\n")
 
     parts.append(
-        "\nНа основе этих данных создай детальное описание.\n\n"
+        "\nНа основе этих данных создай детальное описание.\n\n"
         "Требования к результату:\n"
-        "– 2000–2500 слов\n"
+        "– 450–500 слов (строго)\n"
         "– Без рекомендаций\n"
         "– Без советов\n"
         "– Без клинических диагнозов\n"
         "– Без ссылок на теории и модели\n\n"
-        "В конце не добавляй выводов, рекомендаций или предложений. Только описание.\n\n"
-        "Также после описания напиши его короткую выжимку на 200-300 слов.\n\n"
+        "Также после описания напиши его короткую выжимку на 200–250 слов (строго).\n\n"
+        f"{_formatting_and_structure_rules_stage1()}\n\n"
         "Ответ выдай строго в формате:\n"
         "===FULL===\n"
         "<полное описание>\n"
@@ -141,24 +235,75 @@ def _build_stage1_prompt(answers: dict[int, str]) -> str:
     return "".join(parts)
 
 
-def _stage2_prompt() -> str:
+def _build_stage2_system(summary: str) -> str:
     return (
-        "Теперь покажи три события, которые меня ждут, если я не выйду из жизненного сценария, "
+        f"{ROLE_INTRO}\n\n"
+        "Ниже — контекст (короткая выжимка предыдущего этапа):\n"
+        f"{summary}\n\n"
+        "Правила:\n"
+        "— Пиши в Telegram HTML: только теги <b>, <i>, <code>, <blockquote>.\n"
+        "— Текст строго 200–250 слов (не больше).\n"
+        "— Структурно, без полотна.\n"
+        "— Без рекомендаций/советов/диагнозов.\n"
+    )
+
+
+def _build_stage2_user() -> str:
+    return (
+        "На основании информации обо мне покажи три события, которые меня ждут, если я не выйду из жизненного сценария, "
         "согласно транзактного анализа, какие у них будут последствия, и как они отразятся на мне и моем здоровье.\n\n"
+        "Структура (строго):\n"
+        "<b>🔻 Этап 2: 3 события, если сценарий не менять</b>\n"
+        "<b>1) Событие</b>: (краткое название)\n"
+        "• Почему случится\n"
+        "• Последствия\n"
+        "• Отражение на здоровье/самочувствии\n\n"
+        "<b>2) Событие</b>: (краткое название)\n"
+        "• Почему случится\n"
+        "• Последствия\n"
+        "• Отражение на здоровье/самочувствии\n\n"
+        "<b>3) Событие</b>: (краткое название)\n"
+        "• Почему случится\n"
+        "• Последствия\n"
+        "• Отражение на здоровье/самочувствии\n\n"
         "Ответ выдай строго в формате:\n"
         "===STAGE2===\n"
         "<текст>\n"
     )
 
 
-def _stage3_prompt() -> str:
+def _build_stage3_system(summary: str) -> str:
     return (
-        "А теперь опиши один день из моей жизни через 5 лет, включая детали, о которых я сейчас даже не задумываюсь:\n"
+        f"{ROLE_INTRO}\n\n"
+        "Ниже — контекст (короткая выжимка предыдущего этапа):\n"
+        f"{summary}\n\n"
+        "Правила:\n"
+        "— Пиши в Telegram HTML: только теги <b>, <i>, <code>, <blockquote>.\n"
+        "— Текст строго 200–250 слов (не больше).\n"
+        "— Структурно, без полотна.\n"
+        "— Без рекомендаций/советов/диагнозов.\n"
+    )
+
+
+def _build_stage3_user() -> str:
+    return (
+        "Опиши один день из моей жизни через 5 лет, включая детали, о которых я сейчас даже не задумываюсь:\n"
         "Мои привычки —\n"
         "Образ мышления —\n"
         "С кем я живу —\n"
         "Как выгляжу —\n"
         "Как я себя чувствую —\n\n"
+        "Структура (строго):\n"
+        "<b>🔮 Этап 3: Один день через 5 лет</b>\n"
+        "<b>🌅 Утро</b>\n"
+        "• Привычки\n"
+        "• Состояние/ощущения\n\n"
+        "<b>🏙 День</b>\n"
+        "• Образ мышления\n"
+        "• Люди рядом / с кем живу\n\n"
+        "<b>🌙 Вечер</b>\n"
+        "• Как выгляжу\n"
+        "• Как я себя чувствую\n\n"
         "Ответ выдай строго в формате:\n"
         "===STAGE3===\n"
         "<текст>\n"
@@ -166,20 +311,18 @@ def _stage3_prompt() -> str:
 
 
 def _parse_between(text: str, a: str, b: str) -> str:
-    if a not in text:
+    if not text or a not in text:
         return ""
     after = text.split(a, 1)[1]
-    if b in after:
+    if b and b in after:
         return after.split(b, 1)[0].strip()
     return after.strip()
 
 
-async def _send_long(message: Message, text: str, chunk: int = 3500):
-    # Telegram лимит ~4096, берём запас
-    t = text.strip()
-    while t:
-        await message.answer(t[:chunk])
-        t = t[chunk:]
+# ---------- flow ----------
+
+def _init_user(tg_id: int):
+    STATE[tg_id] = {"q": 0, "answers": {}}
 
 
 @router.callback_query(F.data == "pro:scenario")
@@ -189,31 +332,29 @@ async def scenario_entry(cb: CallbackQuery):
     set_ui_message(tg_id, cb.message.chat.id, cb.message.message_id)
 
     if not is_pro(tg_id):
-        await _render_ui(
-            cb.message,
-            tg_id,
-            "Эта функция доступна только в ⭐ PRO.",
-            reply_markup=pro_locked_keyboard()
-        )
+        await _render_ui(cb.message, tg_id, "Эта функция доступна только в ⭐ PRO.", reply_markup=pro_locked_keyboard())
         return
 
-    saved = await get_scenario(tg_id)
-    has_stage1 = bool(saved and saved.get("stage1", {}).get("analysis_full"))
-
-    text = (
+    await _render_ui(
+        cb.message,
+        tg_id,
         "🧩 Сценарный анализ жизни\n\n"
-        "Описание (заглушка): тест состоит из 3 этапов.\n"
+        "Тест состоит из 3 этапов:\n"
         "1) Сценарный анализ по вашим данным\n"
-        "2) Прогноз событий, если не выйти из сценария\n"
-        "3) Прогноз: один день через 5 лет\n\n"
-        "Ниже выберите действие:"
+        "2) 3 события, если не выйти из сценария\n"
+        "3) Один день через 5 лет\n\n"
+        "Выберите действие:",
+        reply_markup=scenario_menu_keyboard()
     )
-
-    await _render_ui(cb.message, tg_id, text, reply_markup=scenario_menu_keyboard(has_stage1))
 
 
 @router.callback_query(F.data == f"{PREFIX}:start")
 async def start_test(cb: CallbackQuery):
+    """
+    ✅ Новая логика:
+    - если stage1 уже есть в БД → отправляем сохранённый результат (FULL + SUMMARY)
+    - если нет → запускаем опрос
+    """
     await _safe_answer(cb)
     tg_id = cb.from_user.id
     set_ui_message(tg_id, cb.message.chat.id, cb.message.message_id)
@@ -222,14 +363,26 @@ async def start_test(cb: CallbackQuery):
         await _render_ui(cb.message, tg_id, "Эта функция доступна только в ⭐ PRO.", reply_markup=pro_locked_keyboard())
         return
 
+    saved = await get_scenario(tg_id)
+    stage1_full = saved.get("stage1", {}).get("analysis_full") if saved else None
+    stage1_summary = saved.get("stage1", {}).get("analysis_short") if saved else None
+
+    if stage1_full:
+        await cb.message.answer("✅ Этап 1 уже пройден. Отправляю сохранённый результат:")
+        await _send_long_html(cb.message, stage1_full)
+        if stage1_summary:
+            await cb.message.answer("📌 Короткая выжимка:")
+            await _send_long_html(cb.message, stage1_summary)
+        await _send_scenario_menu(cb.message)
+        return
+
     _init_user(tg_id)
     await _render_ui(
-    cb.message,
-    tg_id,
-    f"{_question_text(0)}\n\nНапишите ответ (до {MAX_CUSTOM_CHARS} символов).",
-    reply_markup=back_home_keyboard(is_first_question=True)
-)
-
+        cb.message,
+        tg_id,
+        f"{_question_text(0)}\n\nНапишите ответ (до {MAX_CUSTOM_CHARS} символов).",
+        reply_markup=back_home_keyboard(is_first_question=True)
+    )
 
 
 @router.callback_query(F.data == f"{PREFIX}:back")
@@ -239,24 +392,13 @@ async def back(cb: CallbackQuery):
     set_ui_message(tg_id, cb.message.chat.id, cb.message.message_id)
 
     if tg_id not in STATE:
-        # нет активного теста — просто вернём в экран функции
-        saved = await get_scenario(tg_id)
-        has_stage1 = bool(saved and saved.get("stage1", {}).get("analysis_full"))
-        await _render_ui(cb.message, tg_id, "🧩 Сценарный анализ жизни\n\nВыберите действие:", reply_markup=scenario_menu_keyboard(has_stage1))
+        await _render_ui(cb.message, tg_id, "🧩 Сценарный анализ жизни\n\nВыберите действие:", reply_markup=scenario_menu_keyboard())
         return
 
     st = STATE[tg_id]
 
-    # если уже на первом вопросе — "Назад" возвращает в меню блока
     if st["q"] <= 0:
-        saved = await get_scenario(tg_id)
-        has_stage1 = bool(saved and saved.get("stage1", {}).get("analysis_full"))
-        await _render_ui(
-            cb.message,
-            tg_id,
-            "🧩 Сценарный анализ жизни\n\nВыберите действие:",
-            reply_markup=scenario_menu_keyboard(has_stage1)
-        )
+        await _render_ui(cb.message, tg_id, "🧩 Сценарный анализ жизни\n\nВыберите действие:", reply_markup=scenario_menu_keyboard())
         return
 
     st["q"] -= 1
@@ -268,7 +410,6 @@ async def back(cb: CallbackQuery):
         f"{_question_text(q)}\n\nНапишите ответ (до {MAX_CUSTOM_CHARS} символов).",
         reply_markup=back_home_keyboard(is_first_question=(q == 0))
     )
-
 
 
 @router.message(F.text)
@@ -295,75 +436,73 @@ async def handle_text(message: Message):
     st["q"] += 1
 
     if st["q"] >= len(QUESTIONS):
-        # финал теста
-        await _force_new_ui(message, tg_id, "Готово ✅\n\nСобираю запрос для GPT…")
+        await _force_new_ui(message, tg_id, "Готово ✅\n\nЗапускаю Этап 1 (GPT)…")
         asyncio.create_task(_finish_stage1(message, tg_id))
         return
 
     nq = st["q"]
     await _force_new_ui(
-    message,
-    tg_id,
-    f"{_question_text(nq)}\n\nНапишите ответ (до {MAX_CUSTOM_CHARS} символов).",
-    reply_markup=back_home_keyboard(is_first_question=(nq == 0))
-)
-
+        message,
+        tg_id,
+        f"{_question_text(nq)}\n\nНапишите ответ (до {MAX_CUSTOM_CHARS} символов).",
+        reply_markup=back_home_keyboard(is_first_question=(nq == 0))
+    )
 
 
 async def _finish_stage1(message: Message, tg_id: int):
-    st = STATE.get(tg_id)
-    if not st:
-        return
+    try:
+        st = STATE.get(tg_id)
+        if not st:
+            return
 
-    answers = st["answers"]
+        answers = st["answers"]
+        qa = [{"q": QUESTIONS[i], "a": answers.get(i, "")} for i in range(len(QUESTIONS))]
+        prompt = _build_stage1_prompt(answers)
 
-    # сохраняем вопросы+ответы (как ты просил — вместе)
-    qa = [{"q": QUESTIONS[i], "a": answers.get(i, "")} for i in range(len(QUESTIONS))]
-
-    prompt = _build_stage1_prompt(answers)
-
-    # пока GPT не вызываем — только подтверждение + сохранение Q/A
-    if DRY_RUN_NO_GPT:
         await upsert_stage1(tg_id=tg_id, qa=qa, analysis_full=None, analysis_short=None)
 
-        await message.answer(
-            "✅ Этап 1 завершён (тестовый режим).\n\n"
-            "Запрос успешно сформирован и готов к отправке в GPT.\n"
-            "Сейчас GPT не вызываем, чтобы не тратить деньги."
+        if DRY_RUN_NO_GPT:
+            await message.answer("Тестовый режим: GPT не вызываем.")
+            await _send_long_html(message, f"<b>FINAL PROMPT:</b>\n\n{prompt}")
+            await _send_scenario_menu(message)
+            return
+
+        if not ai:
+            await message.answer("❌ AI не настроен (ai=None).")
+            await _send_scenario_menu(message)
+            return
+
+        resp = await ai.generate(
+            system_prompt=prompt,
+            user_text="Сгенерируй ответ строго по формату. Не добавляй ничего кроме FULL и SUMMARY."
         )
 
-        # покажем промт (обрежем если слишком длинно для Telegram)
-        payload = f"FINAL PROMPT:\n\n{prompt}"
-        if len(payload) > 3800:
-            payload = payload[:3800] + "\n\n…(обрезано для Telegram)"
-        await message.answer(payload)
+        full = _parse_between(resp, "===FULL===", "===SUMMARY===")
+        summary = _parse_between(resp, "===SUMMARY===", "")
 
-        # вернём пользователя в экран функции
-        saved = await get_scenario(tg_id)
-        has_stage1 = bool(saved and saved.get("stage1", {}).get("analysis_full"))
-        await message.answer("🧩 Сценарный анализ жизни\n\nВыберите действие:", reply_markup=scenario_menu_keyboard(has_stage1))
+        if not full:
+            await message.answer("❌ Не удалось распарсить FULL. Ниже сырой ответ:")
+            await _send_long_html(message, resp)
+            await _send_scenario_menu(message)
+            return
+
+        await upsert_stage1(tg_id=tg_id, qa=qa, analysis_full=full, analysis_short=summary)
+
+        await message.answer("✅ Этап 1 готов. Отправляю результат:")
+        await _send_long_html(message, full)
+
+        if summary:
+            await message.answer("📌 Короткая выжимка:")
+            await _send_long_html(message, summary)
+
+        await _send_scenario_menu(message)
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при генерации Stage 1: {e}")
+        await _send_scenario_menu(message)
+
+    finally:
         STATE.pop(tg_id, None)
-        return
-
-    # --- Боевой режим (позже включим) ---
-    if not ai:
-        await message.answer("AI не настроен.")
-        STATE.pop(tg_id, None)
-        return
-
-    # 1) stage1 request
-    resp1 = await ai.generate(system=_build_stage1_prompt(answers), user="")
-    full = _parse_between(resp1, "===FULL===", "===SUMMARY===")
-    summary = _parse_between(resp1, "===SUMMARY===", "")
-
-    await upsert_stage1(tg_id=tg_id, qa=qa, analysis_full=full, analysis_short=summary)
-
-    # покажем full пользователю
-    await _send_long(message, full)
-
-    # вернём в экран функции
-    await message.answer("🧩 Сценарный анализ жизни\n\nВыберите действие:", reply_markup=scenario_menu_keyboard(True))
-    STATE.pop(tg_id, None)
 
 
 @router.callback_query(F.data == f"{PREFIX}:stage2")
@@ -377,33 +516,46 @@ async def stage2(cb: CallbackQuery):
         return
 
     saved = await get_scenario(tg_id)
-    stage1_full = saved and saved.get("stage1", {}).get("analysis_full")
+    summary = saved.get("stage1", {}).get("analysis_short") if saved else None
 
-    if not stage1_full:
+    if not summary:
         await cb.message.answer("Сначала нужно пройти этап 1 (сценарный анализ).")
+        await _send_scenario_menu(cb.message)
         return
 
-    # если уже считали stage2 — просто отдадим
-    s2 = saved.get("stage2", {}).get("text") if saved else None
-    if s2:
-        await _send_long(cb.message, s2)
+    existing = saved.get("stage2", {}).get("text") if saved else None
+    if existing:
+        await cb.message.answer("✅ Этап 2 уже рассчитан. Отправляю снова:")
+        await _send_long_html(cb.message, existing)
+        await _send_scenario_menu(cb.message)
         return
 
     if DRY_RUN_NO_GPT:
-        await cb.message.answer("Этап 2 пока в тестовом режиме (GPT не вызываем).")
+        await cb.message.answer("Тестовый режим: GPT не вызываем.")
+        await _send_scenario_menu(cb.message)
         return
 
     if not ai:
-        await cb.message.answer("AI не настроен.")
+        await cb.message.answer("❌ AI не настроен (ai=None).")
+        await _send_scenario_menu(cb.message)
         return
 
-    # Боевой режим: запрос 2 (контекст = stage1_full)
-    system = "Контекст:\n" + stage1_full
-    user = _stage2_prompt()
-    resp2 = await ai.generate(system=system, user=user)
-    text = _parse_between(resp2, "===STAGE2===", "")
+    system_prompt = _build_stage2_system(summary)
+    user_text = _build_stage2_user()
+
+    resp = await ai.generate(system_prompt=system_prompt, user_text=user_text)
+    text = _parse_between(resp, "===STAGE2===", "")
+
+    if not text:
+        await cb.message.answer("❌ Не удалось распарсить STAGE2. Ниже сырой ответ:")
+        await _send_long_html(cb.message, resp)
+        await _send_scenario_menu(cb.message)
+        return
+
     await upsert_stage2(tg_id, text)
-    await _send_long(cb.message, text)
+    await cb.message.answer("✅ Этап 2 готов:")
+    await _send_long_html(cb.message, text)
+    await _send_scenario_menu(cb.message)
 
 
 @router.callback_query(F.data == f"{PREFIX}:stage3")
@@ -417,28 +569,43 @@ async def stage3(cb: CallbackQuery):
         return
 
     saved = await get_scenario(tg_id)
-    stage1_full = saved and saved.get("stage1", {}).get("analysis_full")
+    summary = saved.get("stage1", {}).get("analysis_short") if saved else None
 
-    if not stage1_full:
+    if not summary:
         await cb.message.answer("Сначала нужно пройти этап 1 (сценарный анализ).")
+        await _send_scenario_menu(cb.message)
         return
 
-    s3 = saved.get("stage3", {}).get("text") if saved else None
-    if s3:
-        await _send_long(cb.message, s3)
+    existing = saved.get("stage3", {}).get("text") if saved else None
+    if existing:
+        await cb.message.answer("✅ Этап 3 уже рассчитан. Отправляю снова:")
+        await _send_long_html(cb.message, existing)
+        await _send_scenario_menu(cb.message)
         return
 
     if DRY_RUN_NO_GPT:
-        await cb.message.answer("Этап 3 пока в тестовом режиме (GPT не вызываем).")
+        await cb.message.answer("Тестовый режим: GPT не вызываем.")
+        await _send_scenario_menu(cb.message)
         return
 
     if not ai:
-        await cb.message.answer("AI не настроен.")
+        await cb.message.answer("❌ AI не настроен (ai=None).")
+        await _send_scenario_menu(cb.message)
         return
 
-    system = "Контекст:\n" + stage1_full
-    user = _stage3_prompt()
-    resp3 = await ai.generate(system=system, user=user)
-    text = _parse_between(resp3, "===STAGE3===", "")
+    system_prompt = _build_stage3_system(summary)
+    user_text = _build_stage3_user()
+
+    resp = await ai.generate(system_prompt=system_prompt, user_text=user_text)
+    text = _parse_between(resp, "===STAGE3===", "")
+
+    if not text:
+        await cb.message.answer("❌ Не удалось распарсить STAGE3. Ниже сырой ответ:")
+        await _send_long_html(cb.message, resp)
+        await _send_scenario_menu(cb.message)
+        return
+
     await upsert_stage3(tg_id, text)
-    await _send_long(cb.message, text)
+    await cb.message.answer("✅ Этап 3 готов:")
+    await _send_long_html(cb.message, text)
+    await _send_scenario_menu(cb.message)

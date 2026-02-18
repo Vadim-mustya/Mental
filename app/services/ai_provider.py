@@ -21,7 +21,7 @@ class AIProvider:
                 {"role": "user", "content": user_text},
             ],
             # для GPT-5 корректнее max_completion_tokens
-            max_completion_tokens=1500,
+            max_completion_tokens=4000,
             temperature=0.7,
         )
 
