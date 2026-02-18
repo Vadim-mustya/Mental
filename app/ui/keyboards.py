@@ -10,7 +10,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 def pro_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 PRO #1 (заглушка)", callback_data="pro:feature:one")],
+        [InlineKeyboardButton(text="🧩 Сценарный анализ жизни", callback_data="pro:scenario")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="pro:home")],
     ])
 

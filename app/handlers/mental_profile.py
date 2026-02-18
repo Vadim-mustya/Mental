@@ -11,6 +11,8 @@ from app.ui.keyboards import main_menu_keyboard, question_keyboard, custom_keybo
 from app.services.ai_provider import AIProvider
 from app.storage.users_store import save_fitness_profile_result  # пока используем текущую функцию хранилища
 from app.services.ui_session import set_ui_message, get_ui_message
+from aiogram.dispatcher.event.bases import SkipHandler
+
 
 router = Router()
 
@@ -316,11 +318,11 @@ async def answer(cb: CallbackQuery):
 async def custom_text(message: Message):
     tg_id = message.from_user.id
     if tg_id not in STATE:
-        return
+        raise SkipHandler
 
     st = STATE[tg_id]
     if not st.get("awaiting_custom"):
-        return
+        raise SkipHandler
 
     text = (message.text or "").strip()
     if not text:

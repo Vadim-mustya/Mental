@@ -6,6 +6,8 @@ from app.services.ai_provider import AIProvider
 from app.handlers import mental_profile
 from app.handlers import pro_menu
 from app.handlers import start
+from app.handlers import pro_scenario_analysis
+
 
 
 async def main():
@@ -21,10 +23,17 @@ async def main():
         model=s.gpt_model,
     )
 
+    pro_scenario_analysis.ai = mental_profile.ai
+
     # подключаем роутеры
     dp.include_router(start.router)
     dp.include_router(pro_menu.router)
+    dp.include_router(pro_scenario_analysis.router)
     dp.include_router(mental_profile.router)
+
+
+    
+
 
     # сбрасываем старые апдейты и отключаем webhook (если он был)
     await bot.delete_webhook(drop_pending_updates=True)

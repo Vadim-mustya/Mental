@@ -26,7 +26,6 @@ async def _render_ui(message: Message, tg_id: int, text: str, reply_markup=None)
 
     chat_id, ui_msg_id = ui
 
-    # если после UI уже были сообщения — создаём новое меню
     if message.message_id and message.message_id > ui_msg_id:
         sent = await message.answer(text, reply_markup=reply_markup)
         set_ui_message(tg_id, sent.chat.id, sent.message_id)
@@ -95,28 +94,4 @@ async def pro_buy(cb: CallbackQuery):
         "Оплата/подписка будет подключена позже.\n\n"
         "Сейчас мы разрабатываем функционал PRO.",
         reply_markup=pro_locked_keyboard()
-    )
-
-
-@router.callback_query(F.data == "pro:feature:one")
-async def pro_feature_one(cb: CallbackQuery):
-    await _safe_answer(cb)
-    tg_id = cb.from_user.id
-    set_ui_message(tg_id, cb.message.chat.id, cb.message.message_id)
-
-    if not is_pro(tg_id):
-        await _render_ui(
-            cb.message,
-            tg_id,
-            "Эта функция доступна только в ⭐ PRO.",
-            reply_markup=pro_locked_keyboard()
-        )
-        return
-
-    await _render_ui(
-        cb.message,
-        tg_id,
-        "✅ PRO #1 (заглушка)\n\n"
-        "Тут будет первая PRO-функция. Архитектура доступа уже готова.",
-        reply_markup=pro_menu_keyboard()
     )
